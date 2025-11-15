@@ -1,22 +1,42 @@
 import sys
+import re
+import argparse
+from collections import deque
+
 import serial
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore
 
-# Serial Setup
-PORT = "COM3"
-BAUD = 115200
-ser = serial.Serial(PORT, BAUD, timeout=1)
+# --- CLI options ---
+parser = argparse.ArgumentParser(description="Real-time serial plotter")
+parser.add_argument("--port", default="COM3", help="Serial port (e.g. COM3)")
+parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
+parser.add_argument("--interval", type=int, default=20, help="Timer interval in ms")
+parser.add_argument("--buf", type=int, default=1000, help="Max samples to keep in memory")
+parser.add_argument("--verbose", action="store_true", help="Print raw serial lines")
+args = parser.parse_args()
 
-# PyQtGraph Setup
+PORT = args.port
+BAUD = args.baud
+TIMER_MS = max(1, args.interval)
+MAX_SAMPLES = max(10, args.buf)
+VERBOSE = args.verbose
+
+# --- Serial setup with error handling ---
+try:
+    ser = serial.Serial(PORT, BAUD, timeout=1)
+except Exception as e:
+    print(f"Failed to open serial port {PORT} @ {BAUD}: {e}")
+    sys.exit(1)
+
+# --- PyQtGraph setup ---
 app = QtWidgets.QApplication([])
-pg.setConfigOption('background', 'w')
-pg.setConfigOption('foreground', 'k')
+pg.setConfigOption("background", "w")
+pg.setConfigOption("foreground", "k")
 
 win = pg.GraphicsLayoutWidget(show=True, title="Real-Time Sensor Plot")
 win.resize(900, 700)
 
-# Stacked plots
 p1 = win.addPlot(title="Voltage (V)")
 p1.addLegend(); p1.showGrid(x=True, y=True)
 win.nextRow()
@@ -28,86 +48,146 @@ win.nextRow()
 p3 = win.addPlot(title="Power (mW)")
 p3.addLegend(); p3.showGrid(x=True, y=True)
 
-# Pens and curve objects
 pen_v = pg.mkPen(color='r', width=2)
 pen_c = pg.mkPen(color='g', width=2)
 pen_p = pg.mkPen(color='b', width=2)
 
-curve_v = p1.plot(name="Voltage", pen=pen_v)
-curve_c = p2.plot(name="Current", pen=pen_c)
-curve_p = p3.plot(name="Power",   pen=pen_p)
+curve_v = p1.plot(pen=pen_v)
+curve_c = p2.plot(pen=pen_c)
+curve_p = p3.plot(pen=pen_p)
 
-# Data buffers
-voltage = []
-current = []
-power = []
-x_time = []
+# --- Data buffers (bounded) ---
+voltage = deque(maxlen=MAX_SAMPLES)
+current = deque(maxlen=MAX_SAMPLES)
+power = deque(maxlen=MAX_SAMPLES)
+x_time = deque(maxlen=MAX_SAMPLES)
 
-encrypt_time_ms = None     # The last "Time to encrypt" value
-sample_count = 0           # Number of data samples received
+encrypt_time_ms = None  # last parsed "Time to encrypt"
+
+# regex to match lines like: "Time to encrypt : 534.894 ms"
+encrypt_re = re.compile(r"Time\s+to\s+encrypt\s*[:\-]?\s*([\d.]+)\s*ms", re.IGNORECASE)
 
 def update():
-    global encrypt_time_ms, sample_count, x_time
+    global encrypt_time_ms
 
-    line = ser.readline().decode(errors="ignore").strip()
+    try:
+        raw = ser.readline()
+    except Exception:
+        return
+
+    if not raw:
+        return
+
+    try:
+        line = raw.decode(errors="ignore").strip()
+    except Exception:
+        return
+
     if not line:
         return
 
-    print(line)  # print raw serial line
+    if VERBOSE:
+        print(line)
 
-    # ----------------------------
-    # Handle encryption time line
-    # ----------------------------
-    if "Time to encrypt" in line:
+    # Check encryption time
+    m = encrypt_re.search(line)
+    if m:
         try:
-            # Format: "Time to encrypt : 534.894 ms"
-            encrypt_time_ms = float(line.split(":")[1].replace("ms", "").strip())
-            print(f"\n[Parsed encryption time] {encrypt_time_ms} ms\n")
-        except:
+            encrypt_time_ms = float(m.group(1))
+            # reset x_time baseline when new encrypt time found
+            x_time.clear()
+            if VERBOSE:
+                print(f"[Parsed encryption time] {encrypt_time_ms} ms")
+
+            # If we already have samples, rebuild x_time in ms and update plots + axis labels
+            n = len(voltage)
+            if n > 0:
+                dt = encrypt_time_ms / max(n - 1, 1) if n > 1 else 0.0
+                x_time.clear()
+                for i in range(n):
+                    x_time.append(i * dt)
+
+                # update curves with ms x axis
+                curve_v.setData(list(x_time), list(voltage))
+                curve_c.setData(list(x_time), list(current))
+                curve_p.setData(list(x_time), list(power))
+
+                # label axes in ms and set range
+                for p in (p1, p2, p3):
+                    p.setLabel('bottom', 'Time', units='ms')
+                    p.setXRange(0, encrypt_time_ms, padding=0.02)
+        except ValueError:
             pass
         return
 
-    # Skip headers
-    if ("Voltage" in line or 
-        "Current" in line or 
-        "Power"   in line):
+    # Skip obvious header lines
+    if any(tok in line for tok in ("Voltage", "Current", "Power")):
         return
 
-    # ----------------------------
-    # Parse numeric data
-    # ----------------------------
+    # Parse CSV line (v, c, p)
     if "," in line:
+        parts = [s.strip() for s in line.split(",")]
+        if len(parts) < 3:
+            return
         try:
-            v, c, p = [float(x) for x in line.split(",")]
+            v = float(parts[0])
+            c = float(parts[1])
+            p = float(parts[2])
+        except ValueError:
+            return
 
-            voltage.append(v)
-            current.append(c)
-            power.append(p)
-            sample_count += 1
+        voltage.append(v)
+        current.append(c)
+        power.append(p)
 
-            # ----------------------------
-            # Build time axis (0 → encrypt_time)
-            # ----------------------------
-            if encrypt_time_ms is not None:
-                # Evenly space samples from 0 → encrypt_time_ms
-                dt = encrypt_time_ms / max(sample_count - 1, 1)
-                x_time = [i * dt for i in range(sample_count)]
-            else:
-                # Fallback: simple sample number
-                x_time = list(range(sample_count))
+        n = len(voltage)
+        # Build x_time: either normalized to encrypt_time_ms or sample index
+        if encrypt_time_ms is not None and n > 1:
+            dt = encrypt_time_ms / max(n - 1, 1)
+            x_time.clear()
+            for i in range(n):
+                x_time.append(i * dt)
+        else:
+            x_time.clear()
+            for i in range(n):
+                x_time.append(i)
 
-            # Update plots
-            curve_v.setData(x_time, voltage)
-            curve_c.setData(x_time, current)
-            curve_p.setData(x_time, power)
+        curve_v.setData(list(x_time), list(voltage))
+        curve_c.setData(list(x_time), list(current))
+        curve_p.setData(list(x_time), list(power))
 
-        except:
-            pass
-
-
+# Timer
 timer = QtCore.QTimer()
 timer.timeout.connect(update)
-timer.start(5)
+timer.start(TIMER_MS)
+
+def on_exit():
+    try:
+        # If we have a final encrypt_time_ms, ensure x-axis shows ms on exit
+        if encrypt_time_ms is not None and len(voltage) > 0:
+            n = len(voltage)
+            if n > 1:
+                dt = encrypt_time_ms / max(n - 1, 1)
+            else:
+                dt = 0.0
+            x_time.clear()
+            for i in range(n):
+                x_time.append(i * dt)
+
+            curve_v.setData(list(x_time), list(voltage))
+            curve_c.setData(list(x_time), list(current))
+            curve_p.setData(list(x_time), list(power))
+
+            for p in (p1, p2, p3):
+                p.setLabel('bottom', 'Time', units='ms')
+                p.setXRange(0, encrypt_time_ms, padding=0.02)
+
+        if ser and ser.is_open:
+            ser.close()
+    except Exception:
+        pass
+
+app.aboutToQuit.connect(on_exit)
 
 if __name__ == "__main__":
     QtWidgets.QApplication.instance().exec_()
