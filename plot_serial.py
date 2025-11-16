@@ -6,6 +6,7 @@ from collections import deque
 import serial
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtWidgets, QtCore
+from PyQt5.QtCore import Qt
 
 # --- CLI options ---
 parser = argparse.ArgumentParser(description="Real-time serial plotter")
@@ -20,7 +21,7 @@ PORT = args.port
 BAUD = args.baud
 TIMER_MS = max(1, args.interval)
 MAX_SAMPLES = max(10, args.buf)
-VERBOSE = args.verbose
+VERBOSE = False #args.verbose
 
 # --- Serial setup with error handling ---
 try:
@@ -34,7 +35,8 @@ app = QtWidgets.QApplication([])
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
 
-win = pg.GraphicsLayoutWidget(show=True, title="Real-Time Sensor Plot")
+# create the plotting widget but do not show it directly; we'll embed in a main window with controls
+win = pg.GraphicsLayoutWidget(title="Real-Time Sensor Plot")
 win.resize(900, 700)
 
 p1 = win.addPlot(title="Voltage (V)")
@@ -96,8 +98,8 @@ def update():
             encrypt_time_ms = float(m.group(1))
             # reset x_time baseline when new encrypt time found
             x_time.clear()
-            if VERBOSE:
-                print(f"[Parsed encryption time] {encrypt_time_ms} ms")
+            # if VERBOSE:
+            print(f"[Parsed encryption time] {encrypt_time_ms} ms")
 
             # If we already have samples, rebuild x_time in ms and update plots + axis labels
             n = len(voltage)
@@ -126,6 +128,7 @@ def update():
 
     # Parse CSV line (v, c, p)
     if "," in line:
+        # print(line)
         parts = [s.strip() for s in line.split(",")]
         if len(parts) < 3:
             return
@@ -161,6 +164,46 @@ timer = QtCore.QTimer()
 timer.timeout.connect(update)
 timer.start(TIMER_MS)
 
+def clear_data():
+    """Clear buffers, curves, and reset axis/labels."""
+    global encrypt_time_ms
+    voltage.clear()
+    current.clear()
+    power.clear()
+    x_time.clear()
+    encrypt_time_ms = None
+
+    # clear plot curves
+    curve_v.setData([], [])
+    curve_c.setData([], [])
+    curve_p.setData([], [])
+
+    # reset axis labels and enable autorange
+    for p in (p1, p2, p3):
+        p.setLabel('bottom', '')  # remove 'Time (ms)' label
+        p.enableAutoRange(True)
+    if VERBOSE:
+        print("Cleared data and reset axes.")
+
+# create main window with controls
+main = QtWidgets.QWidget()
+main_layout = QtWidgets.QVBoxLayout(main)
+
+controls = QtWidgets.QHBoxLayout()
+btn_clear = QtWidgets.QPushButton("Clear")
+btn_clear.setToolTip("Clear data buffers and reset plots")
+btn_clear.clicked.connect(clear_data)
+controls.addWidget(btn_clear)
+controls.addStretch()
+controls.setAlignment(Qt.AlignCenter) 
+
+# btn_clear.setFixedSize(100, 30)
+
+
+main_layout.addWidget(win)
+main_layout.addLayout(controls)
+
+# ensure serial closed on exit and final x-axis redraw preserved
 def on_exit():
     try:
         # If we have a final encrypt_time_ms, ensure x-axis shows ms on exit
@@ -190,4 +233,5 @@ def on_exit():
 app.aboutToQuit.connect(on_exit)
 
 if __name__ == "__main__":
+    main.show()
     QtWidgets.QApplication.instance().exec_()
